@@ -2,7 +2,7 @@
 
 **把 SSH 终端和远程文件树开到 DSH 右侧栏，一会话一标签，主区域继续留给对话。**
 
-[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）的插件：在右侧栏增加 SSH 终端标签页，复用 [`@linxin666/dsh-ssh`](https://www.npmjs.com/package/@linxin666/dsh-ssh) 的主机配置与连接池。每个标签绑定一台主机，左侧是那台主机的目录树，右侧是终端。
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（DSH）的插件：在右侧栏增加 SSH 终端标签页，复用 [`@linxin666/dsh-ssh`](https://www.npmjs.com/package/@linxin666/dsh-ssh) 的主机配置与连接池。每个标签绑定一台主机，左侧是那台主机的目录树（可上传、可下载），右侧是终端。
 
 ## 为什么需要它
 
@@ -15,7 +15,7 @@
 | 位置 | 中央区域整页 | 右侧栏标签页 |
 | 会话 | 被顶掉 | 保留在中央 |
 | 多主机 | 多标签 | **每台主机一个标签**，可并排 |
-| 文件 | SFTP 传输（上传/下载） | 只读目录树，双击路径插入终端 |
+| 文件 | SFTP 传输（上传/下载/进度条） | 目录树 + 上传/下载（单文件，带进度） |
 | 主机管理 / 密钥 / 隧道 | 有 | 无（去左侧 SSH 面板） |
 
 ## 安装
@@ -45,12 +45,23 @@ dsh plugin --profile desktop add link:$(pwd)/dsh-ssh-pane
 ### 文件树
 
 - 从文件系统根目录 `/` 开始，**点目录展开、再点收起**；展开过的目录会缓存，收起不丢
-- 文件显示体积；`⟳` 刷新会清掉缓存并重读根目录
+- 文件显示体积；`⟳` 刷新当前目录
 - **双击文件**把它的绝对路径直接敲进终端当前光标位置（省去手打长路径）
 - 左侧宽度可拖拽调整（140–460 px）
 - 切换主机时文件树重置
 
-> 文件树是只读的。需要上传/下载请用 dsh-ssh 面板的 SFTP。
+### 上传与下载
+
+| 操作 | 行为 |
+|---|---|
+| **⇪ 上传** | 打开文件选择器（可多选），逐个上传到**当前目录**。当前目录 = 你最后点击的那个文件夹；点的是文件则取其父目录；没点过则是 `/`。上传完成后自动刷新该目录 |
+| **⇩ 下载** | 每个文件行右侧的下载按钮，保存到本机。优先用 File System Access API 直接流式写盘，不可用时回退为 Blob 下载 |
+
+- 传输进度显示在文件树顶部（`上传中 name 42%` / `已上传 name` / `失败原因`）
+- 上传走 `POST /api/dsh-ssh/upload`（原始字节 + NDJSON 进度流），下载走 `GET /api/dsh-ssh/download`（二进制流 + `Content-Disposition` 文件名）
+- 下载的落点是**运行浏览器的这台机器**，不是 DSH 宿主
+
+> 目录下载和断点续传不支持（受 dsh-ssh 接口限制，它只支持单文件下载）。需要批量目录传输请用 dsh-ssh 面板的 SFTP 页。
 
 ## 实现
 
@@ -58,7 +69,7 @@ dsh plugin --profile desktop add link:$(pwd)/dsh-ssh-pane
 - **浏览器半**（`client.js`）：
   - 标签类型走右侧栏公开座位——`ctx.sidebarRightTabs.register({ multiple: true, ... })` 声明类型，`slots.register({ name: 'sidebar.right.pane.tab', key })` 画内容，`sidebar.right.pane.tab.title` 画标签上的主机名。与 DSH 自带的文件、浏览器、终端页同一套机制，没有修改 DSH 内核。
   - 终端复用 dsh-ssh 的 `/api/dsh-ssh/terminal` WebSocket（`ready` / `output` / `exit` / `auth_prompt` 帧）。
-  - 文件树复用 `/api/dsh-ssh/ls`（懒加载，逐目录请求）。
+  - 文件树复用 `/api/dsh-ssh/ls`（懒加载，逐目录请求）；上传走 `/api/dsh-ssh/upload`（原始字节 + NDJSON 进度），下载走 `/api/dsh-ssh/download`（二进制流）。
   - 配色取自页面主题变量 `--dsw-alias-*`，随明暗主题切换。
 
 本插件**不保存任何凭据**。密码、密钥、主机配置全部留在 dsh-ssh 自己的存储里。
@@ -71,7 +82,7 @@ dsh plugin --profile desktop add link:$(pwd)/dsh-ssh-pane
 
 - 一个标签对应一台主机与一个 PTY。同一主机可以开多个标签，但同一标签内不能切换主机（换主机即开新标签）。
 - 关闭标签会发送 `close` 帧并结束远端 shell。只想暂时不看，请切到别的标签而不是关掉。
-- 文件树只做目录列举，不做文件内容预览、上传、下载。
+- 文件树只做目录列举与单文件上传/下载，没有目录下载、断点续传、文件内容预览。
 - 依赖 dsh-ssh 的终端与 SFTP 列举协议，dsh-ssh 大版本变动时可能需要同步更新。
 - 页面由 Electron 以 `dsh-app://` 提供时，WebSocket 地址改由 `__DSH_TRANSPORT__.streamBaseUrl` 推导；普通 HTTP 页面直接用自身 origin。
 
@@ -91,6 +102,7 @@ dsh plugin --profile desktop add link:$(pwd)/dsh-ssh-pane
 
 | 版本 | 变化 |
 |---|---|
+| 0.3.0 | 文件树支持上传（多选、进度）与单文件下载 |
 | 0.2.0 | 每个标签绑定一台主机（`multiple`）、左侧远程文件树、双击插入路径、标签显示主机名 |
 | 0.1.0 | 单个 SSH 终端标签页 |
 

@@ -27,7 +27,13 @@ window.__ModuleLoader__.load({
       term: '/dsh-ssh-pane/xterm.js',
       fit: '/dsh-ssh-pane/addon-fit.js',
     }
-    const API = { hosts: '/api/dsh-ssh/hosts', ls: '/api/dsh-ssh/ls', terminal: '/api/dsh-ssh/terminal' }
+    const API = {
+      hosts: '/api/dsh-ssh/hosts',
+      ls: '/api/dsh-ssh/ls',
+      terminal: '/api/dsh-ssh/terminal',
+      upload: '/api/dsh-ssh/upload',
+      download: '/api/dsh-ssh/download',
+    }
 
     const ZH = {
       title: 'SSH 终端',
@@ -43,11 +49,19 @@ window.__ModuleLoader__.load({
       closed: '已断开',
       empty: '空目录',
       loadFail: '读取目录失败',
+      upload: '上传',
+      download: '下载',
+      uploading: '上传中',
+      downloading: '下载中',
+      uploadDone: '已上传',
+      downloadDone: '已下载',
+      uploadFail: '上传失败',
+      downloadFail: '下载失败',
       noHosts: '还没有配置主机，请先在左侧 SSH 面板里添加。',
       hostsFail: '读取主机列表失败',
       socketFail: '终端通道打开失败',
       libFail: 'xterm 资源加载失败',
-      insertHint: '双击文件把路径插入终端',
+      insertHint: '双击插入路径 · ⇪ 上传到当前目录 · ⇩ 下载文件',
     }
     const EN = {
       title: 'SSH terminal',
@@ -63,11 +77,19 @@ window.__ModuleLoader__.load({
       closed: 'Disconnected',
       empty: 'Empty directory',
       loadFail: 'Could not read the directory',
+      upload: 'Upload',
+      download: 'Download',
+      uploading: 'Uploading',
+      downloading: 'Downloading',
+      uploadDone: 'Uploaded',
+      downloadDone: 'Downloaded',
+      uploadFail: 'Upload failed',
+      downloadFail: 'Download failed',
       noHosts: 'No host configured yet — add one in the SSH panel first.',
       hostsFail: 'Could not read the host list',
       socketFail: 'The terminal channel failed to open',
       libFail: 'Could not load the xterm assets',
-      insertHint: 'Double-click a file to type its path',
+      insertHint: 'Double-click to type the path · ⇪ uploads here · ⇩ downloads',
     }
     const L = (() => {
       const lang = String((globalThis.navigator && globalThis.navigator.language) || '').toLowerCase()
@@ -187,6 +209,118 @@ window.__ModuleLoader__.load({
       return (value < 10 ? value.toFixed(1) : String(Math.round(value))) + units[unit]
     }
 
+    /** The parent directory of a remote path (never above the filesystem root). */
+    function parentPath(path) {
+      const clean = String(path).replace(/\/+$/, '')
+      const index = clean.lastIndexOf('/')
+      return index <= 0 ? '/' : clean.slice(0, index)
+    }
+
+    /** The last path segment, used as a display name. */
+    function baseName(path) {
+      const parts = String(path).replace(/\/+$/, '').split('/')
+      return parts[parts.length - 1] || path
+    }
+
+    /**
+     * Upload one browser File to a remote absolute path, reading the NDJSON
+     * progress stream dsh-ssh answers with.
+     * @param file - the picked browser file.
+     * @param alias - host alias.
+     * @param remotePath - absolute destination on the host.
+     * @param onProgress - receives percent updates.
+     */
+    async function uploadFile(file, alias, remotePath, onProgress) {
+      const url = API.upload + '?alias=' + encodeURIComponent(alias) + '&remotePath=' + encodeURIComponent(remotePath)
+      const response = await fetch(url, { method: 'POST', body: file, credentials: 'same-origin' })
+      if (!response.ok || response.body === null) {
+        const text = await response.text().catch(() => '')
+        throw new Error(text === '' ? 'HTTP ' + response.status : text.slice(0, 200))
+      }
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let failure = ''
+      let sawResult = false
+      for (;;) {
+        const chunk = await reader.read()
+        if (chunk.done) break
+        buffer += decoder.decode(chunk.value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() || ''
+        for (const line of lines) {
+          if (line.trim() === '') continue
+          let frame
+          try { frame = JSON.parse(line) } catch { continue }
+          if (frame.type === 'progress' && frame.progress) {
+            onProgress(frame.progress)
+          } else if (frame.type === 'result') {
+            sawResult = true
+            if (!frame.ok) failure = frame.error || 'upload failed'
+          }
+        }
+      }
+      if (failure !== '') throw new Error(failure)
+      if (!sawResult) throw new Error('upload ended without a result frame')
+    }
+
+    /**
+     * Download a remote file, preferring the File System Access API so the
+     * bytes stream straight to disk, and falling back to a Blob link.
+     * @param alias - host alias.
+     * @param remotePath - absolute source path on the host.
+     * @param onProgress - receives percent updates.
+     * @returns the saved filename and byte count.
+     */
+    async function downloadFile(alias, remotePath, onProgress) {
+      const url = API.download + '?alias=' + encodeURIComponent(alias) + '&remotePath=' + encodeURIComponent(remotePath)
+      const response = await fetch(url, { credentials: 'same-origin' })
+      if (!response.ok || response.body === null) {
+        const text = await response.text().catch(() => '')
+        throw new Error(text === '' ? 'HTTP ' + response.status : text.slice(0, 200))
+      }
+      const total = Number(response.headers.get('content-length') || '0')
+      const disposition = response.headers.get('content-disposition') || ''
+      const match = /filename="([^"]+)"/.exec(disposition)
+      const filename = match !== null ? match[1] : (remotePath.split('/').pop() || 'download')
+      const reader = response.body.getReader()
+
+      let writable
+      try {
+        if (typeof window.showSaveFilePicker === 'function') {
+          const handle = await window.showSaveFilePicker({ suggestedName: filename })
+          writable = await handle.createWritable()
+        }
+      } catch {
+        writable = undefined
+      }
+
+      const chunks = []
+      let received = 0
+      for (;;) {
+        const chunk = await reader.read()
+        if (chunk.done) break
+        if (writable !== undefined) await writable.write(chunk.value)
+        else chunks.push(chunk.value)
+        received += chunk.value.length
+        onProgress({ percent: total > 0 ? Math.round((received / total) * 1000) / 10 : 0 })
+      }
+      if (writable !== undefined) {
+        await writable.close()
+        return { filename, bytes: received }
+      }
+      const blob = new Blob(chunks)
+      const objectUrl = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = objectUrl
+      anchor.download = filename
+      document.body.appendChild(anchor)
+      anchor.click()
+      anchor.remove()
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 10000)
+      return { filename, bytes: received }
+    }
+
     /**
      * Host aliases waiting for a tab body that cannot read its own params.
      * Entries are timestamped so a stale one never binds the wrong host.
@@ -293,6 +427,9 @@ window.__ModuleLoader__.load({
       const [loading, setLoading] = React.useState({})
       const [error, setError] = React.useState('')
       const [selected, setSelected] = React.useState('')
+      const [currentDir, setCurrentDir] = React.useState('/')
+      const [transfer, setTransfer] = React.useState(undefined)
+      const fileInputRef = React.useRef(null)
 
       const load = React.useCallback(async (path) => {
         setLoading((current) => ({ ...current, [path]: true }))
@@ -323,6 +460,8 @@ window.__ModuleLoader__.load({
         setExpanded({ '/': true })
         setListing({})
         setSelected('')
+        setCurrentDir('/')
+        setTransfer(undefined)
         setError('')
         if (alias !== '') load('/')
       }, [alias, load])
@@ -334,6 +473,50 @@ window.__ModuleLoader__.load({
         }
         setExpanded((current) => ({ ...current, [path]: true }))
         if (listing[path] === undefined) load(path)
+      }
+
+      /** Drop one directory's cached listing and read it again. */
+      const reloadDir = (dir) => {
+        setListing((current) => {
+          const next = { ...current }
+          delete next[dir]
+          return next
+        })
+        load(dir)
+      }
+
+      /** Upload every picked file into the directory the tree is focused on. */
+      const handleUpload = async (fileList) => {
+        const files = []
+        for (const file of Array.from(fileList || [])) files.push(file)
+        if (files.length === 0) return
+        for (const file of files) {
+          const name = file.name
+          setTransfer({ label: L.uploading + ' ' + name, percent: 0 })
+          try {
+            await uploadFile(file, alias, joinPath(currentDir, name), (progress) => {
+              setTransfer({ label: L.uploading + ' ' + name, percent: Math.round(progress.percent || 0) })
+            })
+            reloadDir(currentDir)
+            setTransfer({ label: L.uploadDone + ' ' + name, percent: 100 })
+          } catch (failure) {
+            setTransfer({ label: L.uploadFail + ': ' + (failure && failure.message ? failure.message : String(failure)), percent: 0 })
+          }
+        }
+      }
+
+      /** Download one remote file to the machine the browser runs on. */
+      const handleDownload = async (path) => {
+        const name = baseName(path)
+        setTransfer({ label: L.downloading + ' ' + name, percent: 0 })
+        try {
+          const result = await downloadFile(alias, path, (progress) => {
+            setTransfer({ label: L.downloading + ' ' + name, percent: Math.round(progress.percent || 0) })
+          })
+          setTransfer({ label: L.downloadDone + ' → ' + result.filename, percent: 100 })
+        } catch (failure) {
+          setTransfer({ label: L.downloadFail + ': ' + (failure && failure.message ? failure.message : String(failure)), percent: 0 })
+        }
       }
 
       const renderLevel = (path, depth) => {
@@ -357,6 +540,7 @@ window.__ModuleLoader__.load({
               },
               title: full,
               onClick: () => {
+                setCurrentDir(isDir ? full : parentPath(full))
                 if (isDir) toggle(full)
                 else setSelected(full)
               },
@@ -365,6 +549,14 @@ window.__ModuleLoader__.load({
               h('span', { style: styles.caret }, isDir ? (isOpen ? '▾' : '▸') : '·'),
               h('span', { style: styles.name }, name + (isDir ? '/' : '')),
               isDir ? null : h('span', { style: styles.size }, formatSize(entry.size)),
+              isDir ? null : h('button', {
+                style: { ...styles.button, padding: '0 4px', fontSize: '10px', marginLeft: '4px', lineHeight: 1.2 },
+                title: L.download + ' ' + name,
+                onClick: (event) => {
+                  event.stopPropagation()
+                  handleDownload(full)
+                },
+              }, '⇩'),
             ),
             isDir && isOpen ? renderLevel(full, depth + 1) : null,
           )
@@ -373,18 +565,35 @@ window.__ModuleLoader__.load({
 
       return h('div', { style: { ...styles.tree, width: props.width + 'px' } },
         h('div', { style: styles.treeHead },
-          h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis' } }, L.files),
-          h('span', { style: { marginLeft: 'auto' } }),
+          h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', flex: '1 1 auto' }, title: currentDir }, L.files),
+          h('button', {
+            style: { ...styles.button, padding: '0 6px', fontSize: '11px' },
+            title: L.upload + ' → ' + currentDir,
+            disabled: alias === '',
+            onClick: () => { if (fileInputRef.current !== null) fileInputRef.current.click() },
+          }, '⇪'),
           h('button', {
             style: { ...styles.button, padding: '0 6px', fontSize: '11px' },
             title: L.refresh,
-            onClick: () => {
-              setListing({})
-              setExpanded({ '/': true })
-              if (alias !== '') load('/')
-            },
+            disabled: alias === '',
+            onClick: () => { if (alias !== '') reloadDir(currentDir) },
           }, '⟳'),
+          h('input', {
+            ref: fileInputRef,
+            type: 'file',
+            multiple: true,
+            style: { display: 'none' },
+            onChange: (event) => {
+              const files = event.target.files
+              event.target.value = ''
+              handleUpload(files)
+            },
+          }),
         ),
+        transfer === undefined ? null : h('div', {
+          style: { ...styles.hint, borderTop: 'none', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+          title: transfer.label,
+        }, transfer.label + (transfer.percent > 0 && transfer.percent < 100 ? ' ' + transfer.percent + '%' : '')),
         error === '' ? null : h('div', { style: { padding: '6px 8px', fontSize: '11px', color: 'var(--dsw-alias-state-error-primary, #e5534b)' } }, error),
         alias === '' ? null : renderLevel('/', 0),
         h('div', { style: styles.hint }, L.insertHint),

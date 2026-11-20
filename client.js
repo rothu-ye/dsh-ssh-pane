@@ -1,14 +1,18 @@
 /**
  * Browser half of @local/dsh-ssh-pane.
  *
- * Registers one right-sidebar tab type (`dsh-ssh-pane`) whose body is an xterm
- * terminal speaking the dsh-ssh terminal WebSocket protocol. The conversation
- * stays in the main column; the terminal lives in the right column, docked like
- * files or the browser.
+ * Registers a right-sidebar tab type (`dsh-ssh-pane`) that hosts one remote
+ * host: an SFTP file tree on the left and an xterm terminal on the right. The
+ * conversation stays in the main column.
  *
- * The tab type is registered through the public two-stage seat documented by
- * @deepseek-ai/dsh-client-ui-sidebar-right: `sidebarRightTabs.register` declares
- * the type, `slots.register('sidebar.right.pane.tab', { key })` draws its body.
+ * Two-stage seat, as documented by @deepseek-ai/dsh-client-ui-sidebar-right:
+ * `sidebarRightTabs.register({ id, kind, multiple, ... })` declares the type,
+ * `slots.register('sidebar.right.pane.tab', { key })` draws a tab body, and the
+ * optional `sidebar.right.pane.tab.title` seat draws its chip.
+ *
+ * One tab binds to one host. Picking another host in a tab's toolbar opens a
+ * NEW tab for that host instead of rebinding the current one, so several hosts
+ * can stay open side by side.
  */
 window.__ModuleLoader__.load({
   id: '@local/dsh-ssh-pane',
@@ -23,41 +27,54 @@ window.__ModuleLoader__.load({
       term: '/dsh-ssh-pane/xterm.js',
       fit: '/dsh-ssh-pane/addon-fit.js',
     }
+    const API = { hosts: '/api/dsh-ssh/hosts', ls: '/api/dsh-ssh/ls', terminal: '/api/dsh-ssh/terminal' }
 
     const ZH = {
       title: 'SSH 终端',
       guide: 'SSH 终端',
       host: '主机',
+      files: '文件',
+      newTab: '新标签',
       reconnect: '重连',
+      refresh: '刷新',
       idle: '未连接',
       connecting: '连接中…',
       ready: '已连接',
       closed: '已断开',
+      empty: '空目录',
+      loadFail: '读取目录失败',
       noHosts: '还没有配置主机，请先在左侧 SSH 面板里添加。',
-      loadFailed: '读取主机列表失败',
-      socketFailed: '终端通道打开失败',
-      libFailed: 'xterm 资源加载失败',
+      hostsFail: '读取主机列表失败',
+      socketFail: '终端通道打开失败',
+      libFail: 'xterm 资源加载失败',
+      insertHint: '双击文件把路径插入终端',
     }
     const EN = {
       title: 'SSH terminal',
       guide: 'SSH terminal',
       host: 'Host',
+      files: 'Files',
+      newTab: 'New tab',
       reconnect: 'Reconnect',
+      refresh: 'Refresh',
       idle: 'Not connected',
       connecting: 'Connecting…',
       ready: 'Connected',
       closed: 'Disconnected',
+      empty: 'Empty directory',
+      loadFail: 'Could not read the directory',
       noHosts: 'No host configured yet — add one in the SSH panel first.',
-      loadFailed: 'Could not read the host list',
-      socketFailed: 'The terminal channel failed to open',
-      libFailed: 'Could not load the xterm assets',
+      hostsFail: 'Could not read the host list',
+      socketFail: 'The terminal channel failed to open',
+      libFail: 'Could not load the xterm assets',
+      insertHint: 'Double-click a file to type its path',
     }
     const L = (() => {
       const lang = String((globalThis.navigator && globalThis.navigator.language) || '').toLowerCase()
       return lang.indexOf('zh') === 0 ? ZH : EN
     })()
 
-    // ----------------------------------------------------------- assets
+    // ------------------------------------------------------------ assets
 
     let assetsPromise
     /**
@@ -76,7 +93,7 @@ window.__ModuleLoader__.load({
         }
         if (!globalThis.Terminal) await injectScript(ASSET.term)
         if (!globalThis.FitAddon) await injectScript(ASSET.fit)
-        if (!globalThis.Terminal) throw new Error(L.libFailed)
+        if (!globalThis.Terminal) throw new Error(L.libFail)
         return {
           Terminal: globalThis.Terminal,
           FitAddon: globalThis.FitAddon && globalThis.FitAddon.FitAddon,
@@ -109,10 +126,7 @@ window.__ModuleLoader__.load({
     const WEB_SCHEMES = new Set(['http:', 'https:', 'blob:', 'data:', 'about:', 'filesystem:'])
 
     /**
-     * The terminal socket URL, resolved exactly as dsh-ssh resolves it: against
-     * the page's own origin for a web page, against the shell-published
-     * transport base for an application-delivered (dsh-app://) page that
-     * carries no upgrade channel of its own.
+     * The terminal socket URL, resolved exactly as dsh-ssh resolves it.
      * @param alias - configured host alias.
      * @param cols - terminal columns.
      * @param rows - terminal rows.
@@ -123,17 +137,17 @@ window.__ModuleLoader__.load({
       const location = window.location
       if (WEB_SCHEMES.has(location.protocol)) {
         const scheme = location.protocol === 'https:' ? 'wss' : 'ws'
-        return scheme + '://' + location.host + '/api/dsh-ssh/terminal?' + query
+        return scheme + '://' + location.host + API.terminal + '?' + query
       }
       const transport = globalThis.__DSH_TRANSPORT__
       const base = transport && typeof transport.streamBaseUrl === 'string' ? transport.streamBaseUrl : ''
-      if (base === '') throw new Error(L.socketFailed)
+      if (base === '') throw new Error(L.socketFail)
       const url = new URL(base)
       const scheme = url.protocol === 'https:' ? 'wss' : 'ws'
-      return scheme + '://' + url.host + '/api/dsh-ssh/terminal?' + query
+      return scheme + '://' + url.host + API.terminal + '?' + query
     }
 
-    // ------------------------------------------------------- appearance
+    // ------------------------------------------------------------ utils
 
     /** Resolve one theme token with a literal fallback. */
     function token(name, fallback) {
@@ -156,45 +170,95 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /** Join one remote path segment onto a directory path. */
+    function joinPath(dir, name) {
+      if (dir === '' || dir === '/') return '/' + name
+      return dir.replace(/\/+$/, '') + '/' + name
+    }
+
+    /** A short human size for a directory listing row. */
+    function formatSize(bytes) {
+      if (typeof bytes !== 'number' || !isFinite(bytes) || bytes < 0) return ''
+      if (bytes < 1024) return bytes + 'B'
+      const units = ['K', 'M', 'G', 'T']
+      let value = bytes / 1024
+      let unit = 0
+      while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++ }
+      return (value < 10 ? value.toFixed(1) : String(Math.round(value))) + units[unit]
+    }
+
+    /**
+     * Host aliases waiting for a tab body that cannot read its own params.
+     * Entries are timestamped so a stale one never binds the wrong host.
+     */
+    const pendingAliases = []
+
+    /** Remember the alias an open was asked for. */
+    function rememberPending(alias) {
+      pendingAliases.push({ alias, at: Date.now() })
+      while (pendingAliases.length > 20) pendingAliases.shift()
+    }
+
+    /** Take the freshest pending alias, or undefined when none is recent. */
+    function takePending() {
+      const entry = pendingAliases.shift()
+      if (entry === undefined) return undefined
+      return Date.now() - entry.at < 5000 ? entry.alias : undefined
+    }
+
+    // ----------------------------------------------------------- styles
+
+    const colors = {
+      border: 'var(--dsw-alias-border-l1, #2a2f3a)',
+      label: 'var(--dsw-alias-label-primary, #e6e8eb)',
+      secondary: 'var(--dsw-alias-label-secondary, #8b929c)',
+      tertiary: 'var(--dsw-alias-label-tertiary, #6b7280)',
+      layer: 'var(--dsw-alias-bg-layer-2, #16181d)',
+      hover: 'var(--dsw-alias-interactive-bg-hover, #2a2f3a)',
+    }
+
     const styles = {
       root: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, width: '100%' },
       bar: {
-        display: 'flex',
-        alignItems: 'center',
-        gap: '8px',
-        padding: '6px 10px',
-        borderBottom: '1px solid var(--dsw-alias-border-l1, #2a2f3a)',
-        fontSize: '12px',
-        flex: '0 0 auto',
+        display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 10px',
+        borderBottom: '1px solid ' + colors.border, fontSize: '12px', flex: '0 0 auto',
       },
-      label: { color: 'var(--dsw-alias-label-secondary, #8b929c)' },
       select: {
-        fontSize: '12px',
-        padding: '2px 6px',
-        borderRadius: '6px',
-        border: '1px solid var(--dsw-alias-border-l1, #2a2f3a)',
-        background: 'var(--dsw-alias-bg-layer-2, #16181d)',
-        color: 'var(--dsw-alias-label-primary, #e6e8eb)',
-        maxWidth: '180px',
+        fontSize: '12px', padding: '2px 6px', borderRadius: '6px',
+        border: '1px solid ' + colors.border, background: colors.layer,
+        color: colors.label, maxWidth: '160px',
       },
       button: {
-        fontSize: '12px',
-        padding: '2px 8px',
-        borderRadius: '6px',
-        border: '1px solid var(--dsw-alias-border-l1, #2a2f3a)',
-        background: 'transparent',
-        color: 'var(--dsw-alias-label-primary, #e6e8eb)',
-        cursor: 'pointer',
+        fontSize: '12px', padding: '2px 8px', borderRadius: '6px',
+        border: '1px solid ' + colors.border, background: 'transparent',
+        color: colors.label, cursor: 'pointer', whiteSpace: 'nowrap',
       },
       status: { marginLeft: 'auto', whiteSpace: 'nowrap' },
       note: {
-        color: 'var(--dsw-alias-label-tertiary, #6b7280)',
-        overflow: 'hidden',
-        textOverflow: 'ellipsis',
-        whiteSpace: 'nowrap',
-        minWidth: 0,
+        color: colors.tertiary, overflow: 'hidden', textOverflow: 'ellipsis',
+        whiteSpace: 'nowrap', minWidth: 0,
       },
+      body: { display: 'flex', flex: '1 1 auto', minHeight: 0 },
+      tree: {
+        display: 'flex', flexDirection: 'column', minWidth: 0,
+        borderRight: '1px solid ' + colors.border, overflow: 'auto', flex: '0 0 auto',
+      },
+      treeHead: {
+        display: 'flex', alignItems: 'center', gap: '6px', padding: '4px 8px',
+        fontSize: '11px', color: colors.secondary, borderBottom: '1px solid ' + colors.border,
+        position: 'sticky', top: 0, background: 'inherit',
+      },
+      row: {
+        display: 'flex', alignItems: 'center', gap: '4px', fontSize: '12px',
+        padding: '2px 6px', cursor: 'pointer', color: colors.label, whiteSpace: 'nowrap',
+      },
+      caret: { width: '10px', flex: '0 0 auto', color: colors.tertiary, fontSize: '10px' },
+      name: { overflow: 'hidden', textOverflow: 'ellipsis' },
+      size: { marginLeft: 'auto', color: colors.tertiary, fontSize: '10px', paddingLeft: '8px' },
+      divider: { width: '4px', cursor: 'col-resize', flex: '0 0 auto', background: 'transparent' },
+      termWrap: { display: 'flex', flexDirection: 'column', flex: '1 1 auto', minWidth: 0, minHeight: 0 },
       term: { flex: '1 1 auto', minHeight: 0, padding: '6px 4px 4px 8px', overflow: 'hidden' },
+      hint: { padding: '2px 8px', fontSize: '10px', color: colors.tertiary, borderTop: '1px solid ' + colors.border },
     }
 
     /** The status pill's colour for one state. */
@@ -202,7 +266,7 @@ window.__ModuleLoader__.load({
       if (status === 'ready') return 'var(--dsw-alias-state-success-primary, #3ba55d)'
       if (status === 'error') return 'var(--dsw-alias-state-error-primary, #e5534b)'
       if (status === 'connecting') return 'var(--dsw-alias-state-warn-primary, #d29922)'
-      return 'var(--dsw-alias-label-tertiary, #6b7280)'
+      return colors.tertiary
     }
 
     /** The status pill's text for one state. */
@@ -213,40 +277,159 @@ window.__ModuleLoader__.load({
       return L.idle
     }
 
-    // ------------------------------------------------------------ view
+    // -------------------------------------------------------- file tree
 
     /**
-     * One terminal tab: pick a configured host, then keep a PTY session alive
-     * on it. Reconnecting bumps an epoch so the effect tears down and re-runs.
+     * A lazy remote directory tree over dsh-ssh's SFTP listing route. Each
+     * directory is fetched the first time it expands; collapsing keeps it.
+     * @param props.alias - host alias to list.
+     * @param props.width - the column's pixel width.
+     * @param props.onInsertPath - receives a clicked file's remote path.
      */
-    function SshPane() {
+    function FileTree(props) {
+      const alias = props.alias
+      const [expanded, setExpanded] = React.useState({})
+      const [listing, setListing] = React.useState({})
+      const [loading, setLoading] = React.useState({})
+      const [error, setError] = React.useState('')
+      const [selected, setSelected] = React.useState('')
+
+      const load = React.useCallback(async (path) => {
+        setLoading((current) => ({ ...current, [path]: true }))
+        setError('')
+        try {
+          const url = API.ls + '?alias=' + encodeURIComponent(alias) + '&path=' + encodeURIComponent(path)
+          const response = await fetch(url, { credentials: 'same-origin' })
+          const payload = await response.json()
+          if (!response.ok) throw new Error(payload && payload.error ? payload.error : 'HTTP ' + response.status)
+          const entries = Array.isArray(payload.entries) ? payload.entries.slice() : []
+          entries.sort((a, b) => {
+            const ad = a.type === 'dir' ? 0 : 1
+            const bd = b.type === 'dir' ? 0 : 1
+            if (ad !== bd) return ad - bd
+            return String(a.name).localeCompare(String(b.name))
+          })
+          setListing((current) => ({ ...current, [path]: entries }))
+        } catch (failure) {
+          setListing((current) => ({ ...current, [path]: [] }))
+          setError(L.loadFail + ': ' + (failure && failure.message ? failure.message : String(failure)))
+        } finally {
+          setLoading((current) => ({ ...current, [path]: false }))
+        }
+      }, [alias])
+
+      // A new host starts from a clean tree at the filesystem root.
+      React.useEffect(() => {
+        setExpanded({ '/': true })
+        setListing({})
+        setSelected('')
+        setError('')
+        if (alias !== '') load('/')
+      }, [alias, load])
+
+      const toggle = (path) => {
+        if (expanded[path] === true) {
+          setExpanded((current) => ({ ...current, [path]: false }))
+          return
+        }
+        setExpanded((current) => ({ ...current, [path]: true }))
+        if (listing[path] === undefined) load(path)
+      }
+
+      const renderLevel = (path, depth) => {
+        const entries = listing[path]
+        if (!entries) return null
+        if (entries.length === 0 && depth === 0) {
+          return [h('div', { key: 'empty', style: { ...styles.row, color: colors.tertiary, paddingLeft: '18px' } }, L.empty)]
+        }
+        return entries.map((entry) => {
+          const name = String(entry.name)
+          const full = joinPath(path, name)
+          const isDir = entry.type === 'dir'
+          const isOpen = expanded[full] === true
+          const isSelected = selected === full
+          return h(React.Fragment, { key: full },
+            h('div', {
+              style: {
+                ...styles.row,
+                paddingLeft: (10 + depth * 12) + 'px',
+                background: isSelected ? colors.hover : 'transparent',
+              },
+              title: full,
+              onClick: () => {
+                if (isDir) toggle(full)
+                else setSelected(full)
+              },
+              onDoubleClick: () => { if (!isDir) props.onInsertPath(full) },
+            },
+              h('span', { style: styles.caret }, isDir ? (isOpen ? '▾' : '▸') : '·'),
+              h('span', { style: styles.name }, name + (isDir ? '/' : '')),
+              isDir ? null : h('span', { style: styles.size }, formatSize(entry.size)),
+            ),
+            isDir && isOpen ? renderLevel(full, depth + 1) : null,
+          )
+        })
+      }
+
+      return h('div', { style: { ...styles.tree, width: props.width + 'px' } },
+        h('div', { style: styles.treeHead },
+          h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis' } }, L.files),
+          h('span', { style: { marginLeft: 'auto' } }),
+          h('button', {
+            style: { ...styles.button, padding: '0 6px', fontSize: '11px' },
+            title: L.refresh,
+            onClick: () => {
+              setListing({})
+              setExpanded({ '/': true })
+              if (alias !== '') load('/')
+            },
+          }, '⟳'),
+        ),
+        error === '' ? null : h('div', { style: { padding: '6px 8px', fontSize: '11px', color: 'var(--dsw-alias-state-error-primary, #e5534b)' } }, error),
+        alias === '' ? null : renderLevel('/', 0),
+        h('div', { style: styles.hint }, L.insertHint),
+      )
+    }
+
+    // ------------------------------------------------------------- pane
+
+    /**
+     * One tab: a remote file tree beside a PTY on the same host.
+     * @param props.alias - resolved host alias for this tab (may be empty).
+     * @param props.openPaneTab - opens another tab for a host.
+     */
+    function SshPane(props) {
       const [hosts, setHosts] = React.useState([])
-      const [alias, setAlias] = React.useState('')
       const [status, setStatus] = React.useState('idle')
       const [note, setNote] = React.useState('')
       const [epoch, setEpoch] = React.useState(0)
+      const [treeWidth, setTreeWidth] = React.useState(230)
+      const [alias, setAlias] = React.useState(typeof props.alias === 'string' ? props.alias : '')
       const mountRef = React.useRef(null)
+      const terminalRef = React.useRef(null)
 
       // Fetch the host inventory once; dsh-ssh owns it and this tab only reads.
       React.useEffect(() => {
         let alive = true
-        fetch('/api/dsh-ssh/hosts', { credentials: 'same-origin' })
+        fetch(API.hosts, { credentials: 'same-origin' })
           .then((response) => response.json())
           .then((payload) => {
             if (!alive) return
             const list = payload && Array.isArray(payload.hosts) ? payload.hosts : []
             setHosts(list)
             if (list.length === 0) {
-              setStatus('error')
               setNote(L.noHosts)
-            } else {
-              setAlias((current) => (current === '' ? list[0].alias : current))
+              return
             }
+            setAlias((current) => {
+              if (current !== '') return current
+              const fallback = takePending()
+              return typeof fallback === 'string' ? fallback : list[0].alias
+            })
           })
-          .catch((error) => {
+          .catch((failure) => {
             if (!alive) return
-            setStatus('error')
-            setNote(L.loadFailed + ': ' + (error && error.message ? error.message : String(error)))
+            setNote(L.hostsFail + ': ' + (failure && failure.message ? failure.message : String(failure)))
           })
         return () => { alive = false }
       }, [])
@@ -281,6 +464,7 @@ window.__ModuleLoader__.load({
           terminal.open(mount)
           if (fit) { try { fit.fit() } catch { /* hidden pane: fit later */ } }
           if (disposed) { try { terminal.dispose() } catch { /* already gone */ } ; return }
+          terminalRef.current = terminal
 
           socket = new WebSocket(terminalUrl(alias, terminal.cols, terminal.rows))
 
@@ -313,7 +497,7 @@ window.__ModuleLoader__.load({
           socket.onerror = () => {
             if (disposed) return
             setStatus('error')
-            setNote(L.socketFailed)
+            setNote(L.socketFail)
           }
           socket.onclose = () => {
             if (disposed) return
@@ -334,10 +518,10 @@ window.__ModuleLoader__.load({
           }
         }
 
-        boot().catch((error) => {
+        boot().catch((failure) => {
           if (disposed) return
           setStatus('error')
-          setNote(error && error.message ? error.message : String(error))
+          setNote(failure && failure.message ? failure.message : String(failure))
         })
 
         return () => {
@@ -353,18 +537,54 @@ window.__ModuleLoader__.load({
             try { socket.close() } catch { /* ignore */ }
           }
           try { if (terminal) terminal.dispose() } catch { /* ignore */ }
+          terminalRef.current = null
         }
       }, [alias, epoch])
 
+      // Type a remote path into the live shell, where the cursor already is.
+      const insertPath = React.useCallback((path) => {
+        const terminal = terminalRef.current
+        if (terminal !== null) terminal.paste(path)
+      }, [])
+
+      const startDrag = (event) => {
+        event.preventDefault()
+        const startX = event.clientX
+        const startWidth = treeWidth
+        const move = (moveEvent) => {
+          setTreeWidth(Math.max(140, Math.min(460, startWidth + moveEvent.clientX - startX)))
+        }
+        const stop = () => {
+          window.removeEventListener('mousemove', move)
+          window.removeEventListener('mouseup', stop)
+        }
+        window.addEventListener('mousemove', move)
+        window.addEventListener('mouseup', stop)
+      }
+
+      const hostOptions = hosts.map((host) => h('option', { key: host.alias, value: host.alias }, host.alias))
+
       return h('div', { style: styles.root },
         h('div', { style: styles.bar },
-          h('span', { style: styles.label }, L.host),
+          h('span', { style: { color: colors.secondary } }, L.host),
           h('select', {
             style: styles.select,
             value: alias,
             disabled: hosts.length === 0,
-            onChange: (event) => setAlias(event.target.value),
-          }, hosts.map((host) => h('option', { key: host.alias, value: host.alias }, host.alias))),
+            title: alias,
+            onChange: (event) => {
+              const next = event.target.value
+              if (next === alias) return
+              // Another host is a different tab, never a rebind of this one.
+              props.openPaneTab(next)
+            },
+          }, hostOptions.length === 0 ? [h('option', { key: 'none', value: '' }, '—')] : hostOptions),
+          h('button', {
+            style: styles.button,
+            title: L.newTab,
+            onClick: () => props.openPaneTab(alias),
+            disabled: alias === '',
+          }, '+'),
           h('button', {
             style: styles.button,
             onClick: () => setEpoch((value) => value + 1),
@@ -373,7 +593,13 @@ window.__ModuleLoader__.load({
           note === '' ? null : h('span', { style: styles.note, title: note }, note),
           h('span', { style: { ...styles.status, color: statusColor(status) } }, statusText(status)),
         ),
-        h('div', { ref: mountRef, style: styles.term }),
+        h('div', { style: styles.body },
+          h(FileTree, { alias, width: treeWidth, onInsertPath: insertPath }),
+          h('div', { style: styles.divider, onMouseDown: startDrag }),
+          h('div', { style: styles.termWrap },
+            h('div', { ref: mountRef, style: styles.term }),
+          ),
+        ),
       )
     }
 
@@ -382,14 +608,53 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots'],
       /**
-       * Declare the tab type and its body against the right sidebar's public
-       * seats, both inside one effect so unloading the plugin removes both.
+       * Declare the tab type, its body and its chip against the right sidebar's
+       * public seats, all inside one effect so unload removes every piece.
        * @param ctx - client plugin context.
        */
       apply(ctx) {
-        ctx.inject(['slots', 'sidebarRightTabs'], (scoped) => {
+        ctx.inject(['slots', 'sidebarRight', 'sidebarRightTabs'], (scoped) => {
           const tabs = scoped.get('sidebarRightTabs')
+          const right = scoped.get('sidebarRight')
           if (tabs === undefined || typeof tabs.register !== 'function') return
+
+          /** Open one more tab bound to a host. */
+          const openPaneTab = (alias) => {
+            if (right === undefined || typeof right.openTab !== 'function') return
+            rememberPending(alias)
+            try {
+              right.openTab(TAB_KIND, { params: { alias, instance: String(Date.now()) } })
+            } catch {
+              // Older shells take the kind alone; the FIFO then supplies the alias.
+              right.openTab(TAB_KIND)
+            }
+          }
+
+          /** Read this tab's params, falling back to the newest pending alias. */
+          const aliasOf = (props) => {
+            const tab = props && props.tab
+            const navigation = tab && tab.navigation
+            const params = (navigation && navigation.params) || (tab && tab.params) || (props && props.params) || {}
+            const alias = params && typeof params.alias === 'string' ? params.alias : ''
+            if (alias !== '') return alias
+            return takePending() || ''
+          }
+
+          /** The body: resolve the alias once per mount, then render the pane. */
+          function PaneBody(props) {
+            const [alias] = React.useState(() => aliasOf(props))
+            return h(SshPane, { alias, openPaneTab })
+          }
+
+          /** The chip: show the host when the tab info carries it. */
+          function PaneTitle(props) {
+            const tab = props && props.tab
+            const navigation = tab && tab.navigation
+            const params = (navigation && navigation.params) || (tab && tab.params) || (props && props.params) || {}
+            const alias = params && typeof params.alias === 'string' && params.alias !== '' ? params.alias : L.title
+            return h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis' } }, alias)
+          }
+
           scoped.effect(() => {
             const disposers = []
             disposers.push(tabs.register({
@@ -397,6 +662,7 @@ window.__ModuleLoader__.load({
               kind: TAB_KIND,
               priority: 'extension',
               keepMounted: true,
+              multiple: true,
               title: () => L.title,
               guide: [{ id: 'ssh-pane', order: 60, title: () => L.guide }],
             }))
@@ -404,7 +670,12 @@ window.__ModuleLoader__.load({
               name: 'sidebar.right.pane.tab',
               key: TAB_ID,
               inject: () => ({}),
-            }, SshPane)))
+            }, PaneBody)))
+            disposers.push(scoped.slots.inject('sidebar.right.pane.tab.title', () => scoped.slots.register({
+              name: 'sidebar.right.pane.tab.title',
+              key: TAB_ID,
+              inject: () => ({}),
+            }, PaneTitle)))
             return () => {
               for (const dispose of disposers.splice(0).reverse()) {
                 try { dispose() } catch { /* one bad disposer must not block the rest */ }

@@ -1,0 +1,4 @@
+- insert:
+    - id: dsh-ssh-pane
+      name: '@local/dsh-ssh-pane'
+      config: {}

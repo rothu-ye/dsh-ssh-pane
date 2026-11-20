@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="SSH terminal pane">
+  <rect x="4" y="8" width="56" height="48" rx="8" fill="#1b2230"/>
+  <rect x="4" y="8" width="56" height="12" rx="8" fill="#263243"/>
+  <circle cx="12" cy="14" r="2" fill="#e5534b"/>
+  <circle cx="19" cy="14" r="2" fill="#d29922"/>
+  <circle cx="26" cy="14" r="2" fill="#3ba55d"/>
+  <path d="M13 32l7 6-7 6" fill="none" stroke="#5ac8fa" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M26 44h13" fill="none" stroke="#e6e8eb" stroke-width="3.4" stroke-linecap="round"/>
+  <rect x="40" y="28" width="13" height="18" rx="3" fill="none" stroke="#3ba55d" stroke-width="2.6"/>
+</svg>

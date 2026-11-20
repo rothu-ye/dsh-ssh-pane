@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "SSH terminal pane",
+    "description": "Opens a dsh-ssh host terminal as a tab in the right sidebar, so the conversation keeps the main column while you work on a remote host.",
+    "detail": "docs/DETAIL.md"
+  }
+}

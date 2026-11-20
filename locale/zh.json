@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "SSH 右侧终端",
+    "description": "把 dsh-ssh 的主机终端开成右侧栏标签页，会话继续占据中央区域，可以一边看对话一边操作远程服务器。",
+    "detail": "docs/DETAIL.md"
+  }
+}

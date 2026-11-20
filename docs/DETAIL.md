@@ -44,7 +44,22 @@ dsh-ssh 自己只注册了两个座位：左侧导航的一行，和中央区域
 - **⇩** 出现在每个文件行右侧，把这一个文件下载到运行浏览器的本机。优先用 File System Access API 流式写盘（不占内存），不支持时回退为 Blob 下载。
 - 进度显示在文件树顶部：`上传中 name 42%`、`已上传 name`、`已下载 → name`、失败原因。
 - 协议：`POST /api/dsh-ssh/upload?alias=&remotePath=`（请求体为原始字节，响应为 NDJSON 进度流，末帧 `{type:"result",ok,transferredBytes}`）；`GET /api/dsh-ssh/download?alias=&remotePath=`（二进制流，带 `Content-Length` 与 `Content-Disposition` 文件名）。
-- 上传的 `remotePath` 必须是绝对路径（dsh-ssh 的限制）。目录下载与断点续传不支持。
+- 上传的 `remotePath` 必须是绝对路径（dsh-ssh 的限制）。断点续传不支持。
+
+## 右键菜单
+
+文件、文件夹、树的空白处都可右键，菜单内容随目标变化：
+
+| 目标 | 菜单项 |
+|---|---|
+| 文件 | 下载 · 复制路径 · 复制到… · 重命名 · 删除 |
+| 文件夹 | 下载（打包 tar.gz） · 在终端中打开 · 新建文件 · 新建文件夹 · 上传到此处 · 复制路径 · 复制到… · 重命名 · 删除 · 刷新此目录 |
+| 空白处 | 新建文件 · 新建文件夹 · 上传到此处 · 刷新此目录 |
+
+- dsh-ssh 没有 mkdir/rm/mv 接口，所以写操作通过它的 `exec` 执行：`mkdir -p --`、`touch --`、`cp -a --`、`mv --`、`rm -rf --`、`tar czf`。所有路径都经单引号转义（`'` → `'\''`）。
+- 目录下载 = 远端 `tar czf /tmp/.dsh-pane-<ts>.tgz -C <父目录> <目录名>` → 下载该包 → 无论成败都 `rm -f` 清理。
+- 取消保存对话框会 `cancel()` 响应流并中止传输，不再回退到 Blob 二次下载。
+- 删除前 `confirm`，文案包含完整路径。
 
 ## 主机与凭据
 

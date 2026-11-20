@@ -1,9 +1,9 @@
 ﻿{
   "name": "@local/dsh-ssh-pane",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
-  "description": "Remote SSH terminal with a live file tree plus upload and download, as right-sidebar tabs. One tab per host; the conversation keeps the main column.",
+  "description": "Remote SSH terminal with a file tree, upload/download and a right-click menu (new, copy, rename, delete), as right-sidebar tabs. One tab per host.",
   "license": "MIT",
   "exports": {
     ".": "./index.js",

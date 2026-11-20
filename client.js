@@ -33,6 +33,7 @@ window.__ModuleLoader__.load({
       terminal: '/api/dsh-ssh/terminal',
       upload: '/api/dsh-ssh/upload',
       download: '/api/dsh-ssh/download',
+      exec: '/api/dsh-ssh/exec',
     }
 
     const ZH = {
@@ -57,6 +58,27 @@ window.__ModuleLoader__.load({
       downloadDone: '已下载',
       uploadFail: '上传失败',
       downloadFail: '下载失败',
+      downloadCancel: '已取消下载',
+      rootDenied: '不能打包整个根目录',
+      packing: '打包中',
+      working: '处理中',
+      copied: '已复制路径',
+      copyToPrompt: '复制到（绝对路径）',
+      renamePrompt: '新名称',
+      mkdirPrompt: '新文件夹名称',
+      touchPrompt: '新文件名称',
+      deleteConfirm: '确定删除这个条目？此操作不可撤销。',
+      downloadDir: '下载（打包为 tar.gz）',
+      copyPath: '复制路径',
+      copyTo: '复制到…',
+      rename: '重命名',
+      remove: '删除',
+      newFile: '新建文件',
+      newFolder: '新建文件夹',
+      uploadHere: '上传到此处',
+      openInTerminal: '在终端中打开',
+      refreshHere: '刷新此目录',
+      done: '完成',
       noHosts: '还没有配置主机，请先在左侧 SSH 面板里添加。',
       hostsFail: '读取主机列表失败',
       socketFail: '终端通道打开失败',
@@ -85,6 +107,27 @@ window.__ModuleLoader__.load({
       downloadDone: 'Downloaded',
       uploadFail: 'Upload failed',
       downloadFail: 'Download failed',
+      downloadCancel: 'Download cancelled',
+      rootDenied: 'Refusing to archive the filesystem root',
+      packing: 'Packing',
+      working: 'Working',
+      copied: 'Path copied',
+      copyToPrompt: 'Copy to (absolute path)',
+      renamePrompt: 'New name',
+      mkdirPrompt: 'New folder name',
+      touchPrompt: 'New file name',
+      deleteConfirm: 'Delete this entry? This cannot be undone.',
+      downloadDir: 'Download as tar.gz',
+      copyPath: 'Copy path',
+      copyTo: 'Copy to…',
+      rename: 'Rename',
+      remove: 'Delete',
+      newFile: 'New file',
+      newFolder: 'New folder',
+      uploadHere: 'Upload here',
+      openInTerminal: 'Open in terminal',
+      refreshHere: 'Refresh this folder',
+      done: 'Done',
       noHosts: 'No host configured yet — add one in the SSH panel first.',
       hostsFail: 'Could not read the host list',
       socketFail: 'The terminal channel failed to open',
@@ -272,7 +315,7 @@ window.__ModuleLoader__.load({
      * @param onProgress - receives percent updates.
      * @returns the saved filename and byte count.
      */
-    async function downloadFile(alias, remotePath, onProgress) {
+    async function downloadFile(alias, remotePath, onProgress, nameHint) {
       const url = API.download + '?alias=' + encodeURIComponent(alias) + '&remotePath=' + encodeURIComponent(remotePath)
       const response = await fetch(url, { credentials: 'same-origin' })
       if (!response.ok || response.body === null) {
@@ -282,17 +325,36 @@ window.__ModuleLoader__.load({
       const total = Number(response.headers.get('content-length') || '0')
       const disposition = response.headers.get('content-disposition') || ''
       const match = /filename="([^"]+)"/.exec(disposition)
-      const filename = match !== null ? match[1] : (remotePath.split('/').pop() || 'download')
+      const filename = nameHint !== undefined && nameHint !== ''
+        ? nameHint
+        : (match !== null ? match[1] : (remotePath.split('/').pop() || 'download'))
       const reader = response.body.getReader()
 
       let writable
-      try {
-        if (typeof window.showSaveFilePicker === 'function') {
-          const handle = await window.showSaveFilePicker({ suggestedName: filename })
-          writable = await handle.createWritable()
+      if (typeof window.showSaveFilePicker === 'function') {
+        let handle
+        try {
+          handle = await window.showSaveFilePicker({ suggestedName: filename })
+        } catch (failure) {
+          // A dismissed picker ends the transfer. Falling through to the Blob
+          // path here would pop a second, unwanted download.
+          if (isCancelled(failure)) {
+            try { await response.body.cancel() } catch { /* already gone */ }
+            throw new TransferCancelled()
+          }
+          handle = undefined
         }
-      } catch {
-        writable = undefined
+        if (handle !== undefined) {
+          try {
+            writable = await handle.createWritable()
+          } catch (failure) {
+            if (isCancelled(failure)) {
+              try { await response.body.cancel() } catch { /* already gone */ }
+              throw new TransferCancelled()
+            }
+            writable = undefined
+          }
+        }
       }
 
       const chunks = []
@@ -319,6 +381,66 @@ window.__ModuleLoader__.load({
       anchor.remove()
       setTimeout(() => URL.revokeObjectURL(objectUrl), 10000)
       return { filename, bytes: received }
+    }
+
+    /** Marker for "the user dismissed the save dialog"; never an error toast. */
+    class TransferCancelled extends Error {
+      constructor() {
+        super('cancelled')
+        this.name = 'TransferCancelled'
+      }
+    }
+
+    /** Whether a picker failure means the user dismissed the dialog. */
+    function isCancelled(failure) {
+      if (failure === null || failure === undefined) return false
+      const name = String(failure.name || '')
+      const message = String(failure.message || '').toLowerCase()
+      return name === 'AbortError' || message.indexOf('abort') >= 0 || message.indexOf('cancel') >= 0
+    }
+
+    /** Quote one value for a POSIX shell command line. */
+    function shQuote(value) {
+      return "'" + String(value).replace(/'/g, "'\\''") + "'"
+    }
+
+    /**
+     * Run one command on the host through dsh-ssh's non-interactive exec route.
+     * @returns the command's stdout.
+     */
+    async function execRemote(alias, command) {
+      const response = await fetch(API.exec, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ alias, command }),
+      })
+      let payload
+      try { payload = await response.json() } catch { payload = undefined }
+      if (!response.ok) throw new Error(payload && payload.error ? payload.error : 'HTTP ' + response.status)
+      const result = (payload && payload.result) || {}
+      if (result.success !== true) {
+        const detail = result.stderr || result.error || ('exit ' + String(result.exitCode))
+        throw new Error(String(detail).trim().slice(0, 300))
+      }
+      return String(result.stdout || '')
+    }
+
+    /**
+     * Pack one remote directory with tar, download the archive, then remove it.
+     * @returns the saved filename and byte count.
+     */
+    async function downloadDirectory(alias, dirPath, onProgress) {
+      const name = baseName(dirPath) || 'directory'
+      const parent = parentPath(dirPath)
+      const archive = '/tmp/.dsh-pane-' + Date.now() + '.tgz'
+      onProgress({ percent: 0 })
+      await execRemote(alias, 'tar czf ' + shQuote(archive) + ' -C ' + shQuote(parent) + ' ' + shQuote(name))
+      try {
+        return await downloadFile(alias, archive, onProgress, name + '.tar.gz')
+      } finally {
+        try { await execRemote(alias, 'rm -f ' + shQuote(archive)) } catch { /* best effort */ }
+      }
     }
 
     /**
@@ -429,7 +551,9 @@ window.__ModuleLoader__.load({
       const [selected, setSelected] = React.useState('')
       const [currentDir, setCurrentDir] = React.useState('/')
       const [transfer, setTransfer] = React.useState(undefined)
+      const [menu, setMenu] = React.useState(undefined)
       const fileInputRef = React.useRef(null)
+      const uploadTargetRef = React.useRef('/')
 
       const load = React.useCallback(async (path) => {
         setLoading((current) => ({ ...current, [path]: true }))
@@ -485,8 +609,9 @@ window.__ModuleLoader__.load({
         load(dir)
       }
 
-      /** Upload every picked file into the directory the tree is focused on. */
+      /** Upload every picked file into the directory the menu targeted. */
       const handleUpload = async (fileList) => {
+        const dir = uploadTargetRef.current
         const files = []
         for (const file of Array.from(fileList || [])) files.push(file)
         if (files.length === 0) return
@@ -494,10 +619,10 @@ window.__ModuleLoader__.load({
           const name = file.name
           setTransfer({ label: L.uploading + ' ' + name, percent: 0 })
           try {
-            await uploadFile(file, alias, joinPath(currentDir, name), (progress) => {
+            await uploadFile(file, alias, joinPath(dir, name), (progress) => {
               setTransfer({ label: L.uploading + ' ' + name, percent: Math.round(progress.percent || 0) })
             })
-            reloadDir(currentDir)
+            reloadDir(dir)
             setTransfer({ label: L.uploadDone + ' ' + name, percent: 100 })
           } catch (failure) {
             setTransfer({ label: L.uploadFail + ': ' + (failure && failure.message ? failure.message : String(failure)), percent: 0 })
@@ -505,19 +630,208 @@ window.__ModuleLoader__.load({
         }
       }
 
-      /** Download one remote file to the machine the browser runs on. */
-      const handleDownload = async (path) => {
-        const name = baseName(path)
+      /** Ask the OS picker for files, then upload them into `dir`. */
+      const pickUpload = (dir) => {
+        uploadTargetRef.current = dir
+        if (fileInputRef.current !== null) fileInputRef.current.click()
+      }
+
+      /** Show a failure or the cancellation note in the transfer line. */
+      const report = (failure) => {
+        if (failure instanceof TransferCancelled) {
+          setTransfer({ label: L.downloadCancel, percent: 0 })
+          return
+        }
+        setTransfer({ label: failure && failure.message ? failure.message : String(failure), percent: 0 })
+      }
+
+      /** Download one entry: a file as-is, a directory as a tar.gz archive. */
+      const handleDownload = async (entry) => {
+        const name = entry.name
+        if (entry.type === 'dir' && entry.path === '/') {
+          setTransfer({ label: L.rootDenied, percent: 0 })
+          return
+        }
+        const progress = (update) => {
+          setTransfer({ label: L.downloading + ' ' + name, percent: Math.round(update.percent || 0) })
+        }
         setTransfer({ label: L.downloading + ' ' + name, percent: 0 })
         try {
-          const result = await downloadFile(alias, path, (progress) => {
-            setTransfer({ label: L.downloading + ' ' + name, percent: Math.round(progress.percent || 0) })
-          })
-          setTransfer({ label: L.downloadDone + ' → ' + result.filename, percent: 100 })
+          if (entry.type === 'dir') {
+            setTransfer({ label: L.packing + ' ' + name, percent: 0 })
+            const packed = await downloadDirectory(alias, entry.path, progress)
+            setTransfer({ label: L.downloadDone + ' → ' + packed.filename, percent: 100 })
+          } else {
+            const result = await downloadFile(alias, entry.path, progress)
+            setTransfer({ label: L.downloadDone + ' → ' + result.filename, percent: 100 })
+          }
         } catch (failure) {
-          setTransfer({ label: L.downloadFail + ': ' + (failure && failure.message ? failure.message : String(failure)), percent: 0 })
+          report(failure)
         }
       }
+
+      /** Run one context-menu action against one entry (or the tree background). */
+      const runAction = async (action, entry) => {
+        setMenu(undefined)
+        if (action === 'download') { await handleDownload(entry); return }
+        const target = entry.path
+        const name = entry.name
+        const parent = entry.type === 'dir' ? target : parentPath(target)
+        try {
+          if (action === 'copyPath') {
+            try { await navigator.clipboard.writeText(target) } catch { /* clipboard may be blocked */ }
+            setTransfer({ label: L.copied + ' ' + target, percent: 100 })
+            return
+          }
+          if (action === 'copyTo') {
+            const destination = globalThis.prompt(L.copyToPrompt, joinPath(currentDir, name))
+            if (destination === null || destination === '') return
+            setTransfer({ label: L.working + ' ' + name, percent: 0 })
+            await execRemote(alias, 'cp -a -- ' + shQuote(target) + ' ' + shQuote(destination))
+            reloadDir(parentPath(destination))
+            setTransfer({ label: L.done, percent: 100 })
+            return
+          }
+          if (action === 'rename') {
+            const next = globalThis.prompt(L.renamePrompt, name)
+            if (next === null || next === '' || next === name) return
+            setTransfer({ label: L.working + ' ' + name, percent: 0 })
+            await execRemote(alias, 'mv -- ' + shQuote(target) + ' ' + shQuote(joinPath(parentPath(target), next)))
+            reloadDir(parentPath(target))
+            setTransfer({ label: L.done, percent: 100 })
+            return
+          }
+          if (action === 'remove') {
+            if (globalThis.confirm(L.deleteConfirm + '\n\n' + target) !== true) return
+            setTransfer({ label: L.working + ' ' + name, percent: 0 })
+            await execRemote(alias, 'rm -rf -- ' + shQuote(target))
+            if (entry.type === 'dir') {
+              setListing((current) => {
+                const next = { ...current }
+                for (const key of Object.keys(next)) {
+                  if (key === target || key.indexOf(target + '/') === 0) delete next[key]
+                }
+                return next
+              })
+            }
+            reloadDir(parentPath(target))
+            setTransfer({ label: L.done, percent: 100 })
+            return
+          }
+          if (action === 'mkdir' || action === 'touch') {
+            const label = action === 'mkdir' ? L.mkdirPrompt : L.touchPrompt
+            const child = globalThis.prompt(label, '')
+            if (child === null || child === '') return
+            setTransfer({ label: L.working + ' ' + child, percent: 0 })
+            const full = joinPath(parent, child)
+            await execRemote(alias, action === 'mkdir' ? 'mkdir -p -- ' + shQuote(full) : 'touch -- ' + shQuote(full))
+            reloadDir(parent)
+            setTransfer({ label: L.done, percent: 100 })
+            return
+          }
+          if (action === 'uploadHere') {
+            pickUpload(parent)
+            return
+          }
+          if (action === 'openInTerminal') {
+            props.onRunText('cd ' + shQuote(target))
+            return
+          }
+          if (action === 'refreshHere') {
+            reloadDir(parent)
+            return
+          }
+        } catch (failure) {
+          report(failure)
+        }
+      }
+
+      /** Open the context menu at the pointer; `entry` undefined means background. */
+      const openMenu = (event, entry) => {
+        event.preventDefault()
+        event.stopPropagation()
+        setMenu({ x: event.clientX, y: event.clientY, entry })
+      }
+
+      // Any press outside the menu, or Escape, dismisses it.
+      React.useEffect(() => {
+        if (menu === undefined) return undefined
+        const close = () => setMenu(undefined)
+        const onKey = (event) => { if (event.key === 'Escape') setMenu(undefined) }
+        window.addEventListener('mousedown', close)
+        window.addEventListener('keydown', onKey)
+        return () => {
+          window.removeEventListener('mousedown', close)
+          window.removeEventListener('keydown', onKey)
+        }
+      }, [menu])
+
+      /** The menu's rows for the current target (undefined = tree background). */
+      const menuItems = () => {
+        if (menu === undefined) return []
+        const entry = menu.entry
+        if (entry === undefined) {
+          const background = { path: currentDir, name: baseName(currentDir), type: 'dir' }
+          return [
+            { label: L.newFile, run: () => runAction('touch', background) },
+            { label: L.newFolder, run: () => runAction('mkdir', background) },
+            { label: L.uploadHere, run: () => runAction('uploadHere', background) },
+            { label: L.refreshHere, run: () => runAction('refreshHere', background) },
+          ]
+        }
+        if (entry.type === 'dir') {
+          return [
+            { label: L.downloadDir, run: () => runAction('download', entry) },
+            { label: L.openInTerminal, run: () => runAction('openInTerminal', entry) },
+            { label: L.newFile, run: () => runAction('touch', entry) },
+            { label: L.newFolder, run: () => runAction('mkdir', entry) },
+            { label: L.uploadHere, run: () => runAction('uploadHere', entry) },
+            { label: L.copyPath, run: () => runAction('copyPath', entry) },
+            { label: L.copyTo, run: () => runAction('copyTo', entry) },
+            { label: L.rename, run: () => runAction('rename', entry) },
+            { label: L.remove, run: () => runAction('remove', entry) },
+            { label: L.refreshHere, run: () => runAction('refreshHere', entry) },
+          ]
+        }
+        return [
+          { label: L.download, run: () => runAction('download', entry) },
+          { label: L.copyPath, run: () => runAction('copyPath', entry) },
+          { label: L.copyTo, run: () => runAction('copyTo', entry) },
+          { label: L.rename, run: () => runAction('rename', entry) },
+          { label: L.remove, run: () => runAction('remove', entry) },
+        ]
+      }
+
+      /** The floating menu, clamped inside the viewport. */
+      const renderMenu = () => {
+        const items = menuItems()
+        if (menu === undefined || items.length === 0) return null
+        const width = 200
+        const height = items.length * 26 + 10
+        const left = Math.max(4, Math.min(menu.x, window.innerWidth - width - 8))
+        const top = Math.max(4, Math.min(menu.y, window.innerHeight - height - 8))
+        return h('div', {
+          style: {
+            position: 'fixed', left: left + 'px', top: top + 'px', zIndex: 80,
+            width: width + 'px', padding: '4px', borderRadius: '8px',
+            border: '1px solid ' + colors.border, background: colors.layer,
+            boxShadow: '0 10px 28px rgba(0, 0, 0, 0.38)',
+          },
+          onMouseDown: (event) => event.stopPropagation(),
+          onContextMenu: (event) => { event.preventDefault(); event.stopPropagation() },
+        }, items.map((item, index) => h('div', {
+          key: index + ':' + item.label,
+          style: {
+            padding: '5px 10px', fontSize: '12px', borderRadius: '6px',
+            cursor: 'pointer', color: colors.label, whiteSpace: 'nowrap',
+            overflow: 'hidden', textOverflow: 'ellipsis',
+          },
+          onMouseEnter: (event) => { event.currentTarget.style.background = colors.hover },
+          onMouseLeave: (event) => { event.currentTarget.style.background = 'transparent' },
+          onClick: () => item.run(),
+        }, item.label)))
+      }
+
 
       const renderLevel = (path, depth) => {
         const entries = listing[path]
@@ -545,6 +859,11 @@ window.__ModuleLoader__.load({
                 else setSelected(full)
               },
               onDoubleClick: () => { if (!isDir) props.onInsertPath(full) },
+              onContextMenu: (event) => {
+                setCurrentDir(isDir ? full : parentPath(full))
+                setSelected(full)
+                openMenu(event, { path: full, name, type: isDir ? 'dir' : 'file' })
+              },
             },
               h('span', { style: styles.caret }, isDir ? (isOpen ? '▾' : '▸') : '·'),
               h('span', { style: styles.name }, name + (isDir ? '/' : '')),
@@ -554,7 +873,7 @@ window.__ModuleLoader__.load({
                 title: L.download + ' ' + name,
                 onClick: (event) => {
                   event.stopPropagation()
-                  handleDownload(full)
+                  handleDownload({ path: full, name, type: 'file' })
                 },
               }, '⇩'),
             ),
@@ -563,14 +882,17 @@ window.__ModuleLoader__.load({
         })
       }
 
-      return h('div', { style: { ...styles.tree, width: props.width + 'px' } },
+      return h('div', {
+        style: { ...styles.tree, width: props.width + 'px' },
+        onContextMenu: (event) => openMenu(event, undefined),
+      },
         h('div', { style: styles.treeHead },
           h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', flex: '1 1 auto' }, title: currentDir }, L.files),
           h('button', {
             style: { ...styles.button, padding: '0 6px', fontSize: '11px' },
             title: L.upload + ' → ' + currentDir,
             disabled: alias === '',
-            onClick: () => { if (fileInputRef.current !== null) fileInputRef.current.click() },
+            onClick: () => pickUpload(currentDir),
           }, '⇪'),
           h('button', {
             style: { ...styles.button, padding: '0 6px', fontSize: '11px' },
@@ -597,6 +919,7 @@ window.__ModuleLoader__.load({
         error === '' ? null : h('div', { style: { padding: '6px 8px', fontSize: '11px', color: 'var(--dsw-alias-state-error-primary, #e5534b)' } }, error),
         alias === '' ? null : renderLevel('/', 0),
         h('div', { style: styles.hint }, L.insertHint),
+        renderMenu(),
       )
     }
 
@@ -756,6 +1079,16 @@ window.__ModuleLoader__.load({
         if (terminal !== null) terminal.paste(path)
       }, [])
 
+      // Type a whole command and press Enter.
+      const runText = React.useCallback((text) => {
+        const terminal = terminalRef.current
+        if (terminal === null) return
+        try {
+          terminal.input(text)
+          terminal.input('\r')
+        } catch { /* the shell may already be gone */ }
+      }, [])
+
       const startDrag = (event) => {
         event.preventDefault()
         const startX = event.clientX
@@ -803,7 +1136,7 @@ window.__ModuleLoader__.load({
           h('span', { style: { ...styles.status, color: statusColor(status) } }, statusText(status)),
         ),
         h('div', { style: styles.body },
-          h(FileTree, { alias, width: treeWidth, onInsertPath: insertPath }),
+          h(FileTree, { alias, width: treeWidth, onInsertPath: insertPath, onRunText: runText }),
           h('div', { style: styles.divider, onMouseDown: startDrag }),
           h('div', { style: styles.termWrap },
             h('div', { ref: mountRef, style: styles.term }),

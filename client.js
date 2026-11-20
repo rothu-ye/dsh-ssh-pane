@@ -79,6 +79,8 @@ window.__ModuleLoader__.load({
       openInTerminal: '在终端中打开',
       refreshHere: '刷新此目录',
       done: '完成',
+      ok: '确定',
+      cancel: '取消',
       noHosts: '还没有配置主机，请先在左侧 SSH 面板里添加。',
       hostsFail: '读取主机列表失败',
       socketFail: '终端通道打开失败',
@@ -128,6 +130,8 @@ window.__ModuleLoader__.load({
       openInTerminal: 'Open in terminal',
       refreshHere: 'Refresh this folder',
       done: 'Done',
+      ok: 'OK',
+      cancel: 'Cancel',
       noHosts: 'No host configured yet — add one in the SSH panel first.',
       hostsFail: 'Could not read the host list',
       socketFail: 'The terminal channel failed to open',
@@ -533,6 +537,72 @@ window.__ModuleLoader__.load({
       return L.idle
     }
 
+    // ------------------------------------------------------------ dialog
+
+    /**
+     * A small in-app modal, because an Electron renderer refuses
+     * `window.prompt`. `kind: 'input'` resolves to the text or null;
+     * `kind: 'confirm'` resolves to true or false.
+     */
+    function Dialog(props) {
+      const [value, setValue] = React.useState(typeof props.initial === 'string' ? props.initial : '')
+      const inputRef = React.useRef(null)
+
+      React.useEffect(() => {
+        if (inputRef.current !== null) {
+          inputRef.current.focus()
+          if (typeof inputRef.current.select === 'function') inputRef.current.select()
+        }
+      }, [])
+
+      const accept = () => props.onResolve(props.kind === 'input' ? value : true)
+      const dismiss = () => props.onResolve(props.kind === 'input' ? null : false)
+
+      return h('div', {
+        style: {
+          position: 'fixed', inset: 0, zIndex: 90, background: 'rgba(0, 0, 0, 0.45)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        },
+        onMouseDown: dismiss,
+      }, h('div', {
+        style: {
+          minWidth: '320px', maxWidth: '78vw', padding: '14px', borderRadius: '10px',
+          background: colors.layer, border: '1px solid ' + colors.border,
+          boxShadow: '0 12px 32px rgba(0, 0, 0, 0.42)',
+        },
+        onMouseDown: (event) => event.stopPropagation(),
+      },
+        h('div', {
+          style: { fontSize: '12px', color: colors.secondary, marginBottom: '8px', whiteSpace: 'pre-wrap', lineHeight: 1.5 },
+        }, props.title),
+        props.kind === 'input' ? h('input', {
+          ref: inputRef,
+          value,
+          onChange: (event) => setValue(event.target.value),
+          onKeyDown: (event) => {
+            if (event.key === 'Enter') accept()
+            if (event.key === 'Escape') dismiss()
+          },
+          style: {
+            width: '100%', boxSizing: 'border-box', fontSize: '13px', padding: '6px 8px',
+            borderRadius: '6px', border: '1px solid ' + colors.border,
+            background: colors.layer, color: colors.label,
+          },
+        }) : null,
+        h('div', { style: { display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '12px' } },
+          h('button', { style: styles.button, onClick: dismiss }, L.cancel),
+          h('button', {
+            style: {
+              ...styles.button,
+              borderColor: props.danger === true ? 'var(--dsw-alias-state-error-primary, #e5534b)' : colors.border,
+              color: props.danger === true ? 'var(--dsw-alias-state-error-primary, #e5534b)' : colors.label,
+            },
+            onClick: accept,
+          }, L.ok),
+        ),
+      ))
+    }
+
     // -------------------------------------------------------- file tree
 
     /**
@@ -552,6 +622,7 @@ window.__ModuleLoader__.load({
       const [currentDir, setCurrentDir] = React.useState('/')
       const [transfer, setTransfer] = React.useState(undefined)
       const [menu, setMenu] = React.useState(undefined)
+      const [dialog, setDialog] = React.useState(undefined)
       const fileInputRef = React.useRef(null)
       const uploadTargetRef = React.useRef('/')
 
@@ -684,7 +755,7 @@ window.__ModuleLoader__.load({
             return
           }
           if (action === 'copyTo') {
-            const destination = globalThis.prompt(L.copyToPrompt, joinPath(currentDir, name))
+            const destination = await ask('input', L.copyToPrompt, joinPath(currentDir, name))
             if (destination === null || destination === '') return
             setTransfer({ label: L.working + ' ' + name, percent: 0 })
             await execRemote(alias, 'cp -a -- ' + shQuote(target) + ' ' + shQuote(destination))
@@ -693,7 +764,7 @@ window.__ModuleLoader__.load({
             return
           }
           if (action === 'rename') {
-            const next = globalThis.prompt(L.renamePrompt, name)
+            const next = await ask('input', L.renamePrompt, name)
             if (next === null || next === '' || next === name) return
             setTransfer({ label: L.working + ' ' + name, percent: 0 })
             await execRemote(alias, 'mv -- ' + shQuote(target) + ' ' + shQuote(joinPath(parentPath(target), next)))
@@ -702,7 +773,8 @@ window.__ModuleLoader__.load({
             return
           }
           if (action === 'remove') {
-            if (globalThis.confirm(L.deleteConfirm + '\n\n' + target) !== true) return
+            const approved = await ask('confirm', L.deleteConfirm + '\n\n' + target, '', true)
+            if (approved !== true) return
             setTransfer({ label: L.working + ' ' + name, percent: 0 })
             await execRemote(alias, 'rm -rf -- ' + shQuote(target))
             if (entry.type === 'dir') {
@@ -720,7 +792,7 @@ window.__ModuleLoader__.load({
           }
           if (action === 'mkdir' || action === 'touch') {
             const label = action === 'mkdir' ? L.mkdirPrompt : L.touchPrompt
-            const child = globalThis.prompt(label, '')
+            const child = await ask('input', label, '')
             if (child === null || child === '') return
             setTransfer({ label: L.working + ' ' + child, percent: 0 })
             const full = joinPath(parent, child)
@@ -751,6 +823,18 @@ window.__ModuleLoader__.load({
         event.preventDefault()
         event.stopPropagation()
         setMenu({ x: event.clientX, y: event.clientY, entry })
+      }
+
+      /** Ask for one line of text (or a confirmation) in an in-app modal. */
+      const ask = (kind, title, initial, danger) => new Promise((resolve) => {
+        setDialog({ kind, title, initial, danger, resolve })
+      })
+
+      /** Settle the open dialog and close it. */
+      const resolveDialog = (value) => {
+        const current = dialog
+        setDialog(undefined)
+        if (current !== undefined) current.resolve(value)
       }
 
       // Any press outside the menu, or Escape, dismisses it.
@@ -920,6 +1004,7 @@ window.__ModuleLoader__.load({
         alias === '' ? null : renderLevel('/', 0),
         h('div', { style: styles.hint }, L.insertHint),
         renderMenu(),
+        dialog === undefined ? null : h(Dialog, { ...dialog, onResolve: resolveDialog }),
       )
     }
 
@@ -937,6 +1022,7 @@ window.__ModuleLoader__.load({
       const [epoch, setEpoch] = React.useState(0)
       const [treeWidth, setTreeWidth] = React.useState(230)
       const [alias, setAlias] = React.useState(typeof props.alias === 'string' ? props.alias : '')
+      const [authAsk, setAuthAsk] = React.useState(undefined)
       const mountRef = React.useRef(null)
       const terminalRef = React.useRef(null)
 
@@ -1019,11 +1105,12 @@ window.__ModuleLoader__.load({
               setNote(frame.error ? String(frame.error) : 'exit ' + String(frame.code))
             } else if (frame.type === 'auth_prompt') {
               const prompts = Array.isArray(frame.prompts) ? frame.prompts : []
-              const responses = prompts.map((prompt) => {
-                const label = prompt && prompt.prompt ? String(prompt.prompt) : 'code'
-                try { return globalThis.prompt(label) || '' } catch { return '' }
-              })
-              send({ type: 'auth_response', responses })
+              const titles = prompts.map((prompt) => (prompt && prompt.prompt ? String(prompt.prompt) : 'code'))
+              if (titles.length === 0) {
+                send({ type: 'auth_response', responses: [] })
+                return
+              }
+              setAuthAsk({ remaining: titles, answers: [], send })
             }
           }
           socket.onerror = () => {
@@ -1089,6 +1176,20 @@ window.__ModuleLoader__.load({
         } catch { /* the shell may already be gone */ }
       }, [])
 
+      /** Answer one keyboard-interactive prompt at a time, then reply. */
+      const resolveAuth = (value) => {
+        const current = authAsk
+        setAuthAsk(undefined)
+        if (current === undefined) return
+        const answers = value === null ? current.answers : current.answers.concat([value])
+        const remaining = value === null ? [] : current.remaining.slice(1)
+        if (remaining.length === 0) {
+          current.send({ type: 'auth_response', responses: answers })
+          return
+        }
+        setAuthAsk({ ...current, answers, remaining })
+      }
+
       const startDrag = (event) => {
         event.preventDefault()
         const startX = event.clientX
@@ -1142,6 +1243,12 @@ window.__ModuleLoader__.load({
             h('div', { ref: mountRef, style: styles.term }),
           ),
         ),
+        authAsk === undefined ? null : h(Dialog, {
+          kind: 'input',
+          title: authAsk.remaining[0],
+          initial: '',
+          onResolve: resolveAuth,
+        }),
       )
     }
 
